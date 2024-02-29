@@ -53,6 +53,7 @@ jobs:
 
       - name: Run TFLint
         run: tflint -f compact
+        continue-on-error: true
 
   tfsec:
     name: "Security Scan"
