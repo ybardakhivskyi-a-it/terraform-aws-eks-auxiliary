@@ -1,0 +1,677 @@
+# Cluster Monitoring and alerting with OTL+CloudWatch
+locals {
+  # Helm versions
+  otl_helm_version = "0.53.0"
+  # K8s namespace to deploy
+  monitoring_namespace = "monitoring" 
+  # K8S Service Account Name
+  otl_service_account_name = "aws-otel-sa"
+  # Helm ovveride values
+  otl_agent_helm_values = [<<EOF
+    mode: "daemonset"
+
+    presets:
+      logsCollection:
+        enabled: true
+        includeCollectorLogs: true
+        storeCheckpoints: true
+
+    config:
+      exporters:
+        awsemf:
+          region: "${var.aws_region}"
+          namespace: ContainerInsights
+          log_group_name: '/aws/containerinsights/{ClusterName}/performance'
+          log_stream_name: 'instanceTelemetry/{NodeName}'
+          resource_to_telemetry_conversion:
+            enabled: true
+          dimension_rollup_option: NoDimensionRollup
+          output_destination: cloudwatch
+          no_verify_ssl: false
+          parse_json_encoded_attr_values: [Sources, kubernetes]
+          metric_declarations:
+          # https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/receiver/awscontainerinsightreceiver/README.md
+            # *** ALERTS ***
+            - dimensions: [[ClusterName]]
+              metric_name_selectors:
+                - cluster_failed_node_count
+            - dimensions: [[ClusterName]]
+              metric_name_selectors:
+                - node_cpu_utilization
+                - node_memory_utilization
+                - node_filesystem_utilization
+            - dimensions: [[ClusterName]]
+              metric_name_selectors:
+                - pod_number_of_running_containers
+            - dimensions: [[ClusterName], [PodName, Namespace, ClusterName]]
+              metric_name_selectors:
+                - number_of_container_restarts
+            %{~if local.collect_minimal_statistic~}
+            # *** MINIMAL STATISTIC ***
+            - dimensions: [[ClusterName, NodeName, InstanceId]]
+              metric_name_selectors:
+                - node_cpu_utilization
+                - node_memory_utilization
+                - node_diskio_io_serviced_total
+                - node_diskio_io_service_bytes_total
+                - node_filesystem_utilization
+            - dimensions: [[ClusterName, Namespace, PodName]]
+              metric_name_selectors:
+                - pod_cpu_usage_total
+                - pod_cpu_request
+                - pod_cpu_limit
+                - pod_memory_limit
+                - pod_memory_request
+                - pod_memory_usage
+            %{~endif~}           
+        logging:
+          loglevel: info
+      processors:
+        batch/metrics:
+          timeout: ${var.k8s_metrics_batch_interval}
+      receivers:
+        jaeger:
+          protocols:
+            grpc:
+              endpoint: $${MY_POD_IP}:14250
+            thrift_http:
+              endpoint: $${MY_POD_IP}:14268
+            thrift_compact:
+              endpoint: $${MY_POD_IP}:6831
+        otlp:
+          protocols:
+            grpc:
+              endpoint: $${MY_POD_IP}:4317
+            http:
+              endpoint: $${MY_POD_IP}:4318
+        prometheus:
+          config:
+            scrape_configs:
+              - job_name: opentelemetry-collector
+                scrape_interval: 10s
+                static_configs:
+                  - targets:
+                      - $${MY_POD_IP}:8888
+        zipkin:
+          endpoint: $${MY_POD_IP}:9411
+        awscontainerinsightreceiver:
+          collection_interval: ${local.k8s_metrics_interval}
+          container_orchestrator: eks
+          add_service_as_attribute: true 
+          prefer_full_pod_name: false 
+          add_full_pod_name_metric_label: false
+      service:
+        pipelines:
+          metrics:
+            receivers: [awscontainerinsightreceiver]
+            processors: [batch/metrics]
+            exporters: [awsemf]
+
+    serviceAccount:
+      create: false
+      name: "${local.otl_service_account_name}"
+
+    clusterRole:
+      create: true
+      annotations: {}
+      name: "otel-role"
+      rules:
+        - apiGroups: ['*']
+          resources: ['*']
+          verbs: ['*']
+        - apiGroups:
+          - "*"
+          resources:
+          - events
+          - namespaces
+          - namespaces/status
+          - nodes
+          - nodes/spec
+          - pods
+          - pods/status
+          - replicationcontrollers
+          - replicationcontrollers/status
+          - resourcequotas
+          - services
+          - endpoints
+          - nodes/proxy
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - apps
+          resources:
+          - daemonsets
+          - deployments
+          - replicasets
+          - statefulsets
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - extensions
+          resources:
+          - daemonsets
+          - deployments
+          - replicasets
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - batch
+          resources:
+          - jobs
+          - cronjobs
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - "*"
+          resources:
+          - horizontalpodautoscalers
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - "*"
+          resources:
+          - nodes/stats
+          - configmaps
+          - events
+          - leases
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+
+      clusterRoleBinding:
+        annotations: {}
+        name: "otel-role"
+
+    nodeSelector: {}
+    tolerations: 
+      - key: dedicated
+        operator: Equal
+        value: ${var.toleration_pool}
+        effect: NoSchedule
+    affinity: {}
+    topologySpreadConstraints: {}
+
+    extraEnvs:
+    - name: KUBE_NODE_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: spec.nodeName
+    - name: K8S_NODE_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: spec.nodeName
+    - name: HOST_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    - name: K8S_POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: HOST_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+    - name: K8S_NAMESPACE
+      valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+
+    resources:
+      limits:
+        cpu: 256m
+        memory: 1024Mi
+      requests:
+        cpu: 50m
+        memory: 512Mi
+
+    hostNetwork: true
+
+    extraVolumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+          type: ''
+      - name: rootfs
+        hostPath:
+          path: /
+      - name: varlibdocker
+        hostPath:
+          path: /var/lib/docker
+      - name: containerdsock
+        hostPath:
+          path: /run/containerd/containerd.sock
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: devdisk
+        hostPath:
+          path: /dev/disk/
+    extraVolumeMounts:
+      - name: varlog
+        readOnly: true
+        mountPath: /var/log
+      - name: rootfs
+        mountPath: /rootfs
+        readOnly: true
+      - name: containerdsock
+        mountPath: /run/containerd/containerd.sock
+        readOnly: true
+      - name: sys
+        mountPath: /sys
+        readOnly: true
+      - name: devdisk
+        mountPath: /dev/disk
+        readOnly: true
+    EOF
+  ]
+  otl_deployment_helm_values = [<<EOF
+    mode: "deployment"
+
+    replicaCount: 1
+
+    presets:
+      kubernetesEvents:
+        enabled: false
+
+    config:
+      exporters:
+        awscloudwatchlogs:
+          log_group_name: "${local.eks_event_log_group}"
+          log_stream_name: "${local.eks_event_log_group_stream}"
+          region: "${var.aws_region}"
+          log_retention: "${var.k8s_ns_events_retention_days}"
+          sending_queue:
+            queue_size: 50
+          retry_on_failure:
+            enabled: true
+            initial_interval: 10ms
+      receivers:
+        k8sobjects:
+          objects:
+            - name: events
+              mode: watch
+              field_selector: type=${var.k8s_ns_events_severity}
+              group: events.k8s.io
+              namespaces: [${var.k8s_ns_events_to_collect}]
+
+      service:
+        pipelines:
+          logs:
+            receivers: [k8sobjects]
+            exporters: [awscloudwatchlogs]
+
+    serviceAccount:
+      create: false
+      name: "${local.otl_service_account_name}"
+
+    clusterRole:
+      create: false
+      name: "otel-role"
+
+    nodeSelector:
+      pool: ${var.toleration_pool}
+    tolerations: 
+      - key: dedicated
+        operator: Equal
+        value: ${var.toleration_pool}
+        effect: NoSchedule
+    affinity: {}
+    topologySpreadConstraints: {}
+
+    ports:
+      otlp:
+        enabled: false
+      otlp-http:
+        enabled: true
+        containerPort: 4318
+        servicePort: 4318
+        hostPort: 8318
+        protocol: TCP
+      jaeger-compact:
+        enabled: false
+      jaeger-thrift:
+        enabled: false
+      jaeger-grpc:
+        enabled: false
+      zipkin:
+        enabled: false
+      metrics:
+        enabled: false
+    
+    resources:
+      requests:
+        cpu: 50m
+        memory: 50Mi
+      limits:
+        cpu: 256m
+        memory: 512Mi
+    EOF
+  ]
+  # AWS IAM IRSA
+  otl_irsa_iam_role_name = "${var.cluster_name}-otl-iam-role"
+}
+
+resource "aws_iam_role_policy_attachment" "irsa_role" {
+  role       = module.agents[0].irsa_role_id
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+module "agents" {
+  source = "./modules/helm-chart"
+  count  = var.has_monitoring && var.monitoring_config != {} ? 1 : 0
+  name       = "opentelemetry-collector-agents"
+  repository = "https://open-telemetry.github.io/opentelemetry-helm-charts"
+  chart      = "opentelemetry-collector"
+  namespace    = local.monitoring_namespace
+  helm_version = local.otl_helm_version
+  service_account_name = local.otl_service_account_name
+  irsa_iam_role_name   = local.otl_irsa_iam_role_name
+  iam_openid_provider_url = var.iam_openid_provider_url
+  iam_openid_provider_arn = var.iam_openid_provider_arn
+  values = local.otl_agent_helm_values
+
+  depends_on = [
+#    aws_cloudwatch_log_group.events,
+    kubernetes_namespace_v1.general
+    ]
+}
+
+
+### opentelemetry-collector deployment
+## Getting kubernetes events
+locals {
+  eks_event_log_group        = "/aws/containerinsights/${var.cluster_name}/events"
+  eks_event_log_group_stream = "${var.cluster_name}-stream"
+  eks_event_metric_name      = "${var.cluster_name}-${var.k8s_ns_events_severity}EventCount"
+}
+resource "aws_cloudwatch_log_group" "events" {
+  name              = local.eks_event_log_group
+  retention_in_days = var.k8s_ns_events_retention_days
+}
+
+resource "aws_cloudwatch_log_metric_filter" "events" {
+  name           = "EventCount"
+  pattern        = "{ $.body.type != \"DELETED\" }"
+  log_group_name = local.eks_event_log_group
+
+  metric_transformation {
+    name          = local.eks_event_metric_name
+    namespace     = "ContainerInsights"
+    value         = "1"
+    default_value = "0"
+  }
+
+  depends_on = [
+    aws_cloudwatch_log_group.events
+  ]
+}
+
+module "deployment" {
+  source = "./modules/helm-chart"
+  count  = var.has_monitoring && var.monitoring_config != {} ? 1 : 0
+  name       = "opentelemetry-collector-deployment"
+  repository = "https://open-telemetry.github.io/opentelemetry-helm-charts"
+  chart      = "opentelemetry-collector"
+  namespace    = local.monitoring_namespace
+  helm_version = local.otl_helm_version
+  service_account_name = local.otl_service_account_name
+  values = local.otl_deployment_helm_values
+
+  depends_on = [
+    kubernetes_namespace_v1.general,
+    module.agents,
+    aws_cloudwatch_log_group.events
+    ]
+}
+
+
+
+###########################################################
+########## Alerts
+###########################################################
+locals {
+  alert_prefix = "${local.cw_alert_prefix}-${var.cluster_name}"
+  # If we need to create an AWS CloudWatch Alerts setup
+  create_cw_alerts = lookup(var.monitoring_config, "create_alerts", false)
+  # AWS CloudWatch Alerts name prefix
+  cw_alert_prefix       = lookup(lookup(var.monitoring_config, "alert_config", {}), "alert_prefix", "EKS-Cluster")
+  # AWS CloudWatch Alerts period in seconds
+  cw_alert_period       = lookup(lookup(var.monitoring_config, "alert_config", {}), "alert_period", 300)
+  # AWS CloudWatch Alerts evaluation period: cw_evaluation_periods * cw_alert_period ==> alert
+  cw_evaluation_periods = lookup(lookup(var.monitoring_config, "alert_config", {}), "evaluation_periods", 2)
+  # List of the AWS SNS arns to send alert notifications to
+  cw_alert_notification_sns_arns = lookup(lookup(var.monitoring_config, "alert_config", {}), "notification_sns_arns", [])
+
+  # In additional to the alert metrics per cluster, we could collect the minimal statistic per kubernetes pods and nodes
+  collect_minimal_statistic = lookup(var.monitoring_config, "collect_minimal_statistic", false)
+  # Interval setup. If we put "5m", the metrics resolution could be covered by the AWS Free tire
+  # "1m" is the higest resolution here
+  # Kubernetes metrics scrape inerval in minutes. Could be in seconds as well: 30s
+  k8s_metrics_interval = lookup(var.monitoring_config, "k8s_metrics_interval", "5m")
+
+}
+
+### Create CW alerts
+# For 3 minutes crossing we have to obtain an alert:
+## cluster_failed_node_count max | Cluster > 0 && missing data
+## node_cpu_utilization max | Cluster > 90
+## node_memory_utilization max | Cluster > 90
+## node_filesystem_utilization max | Cluster >90
+## pod_number_of_running_containers min | Cluster < 1
+## number_of_container_restarts anomaly | Cluster > 10
+#? number_of_container_restarts max | ns kube-system OR ns general > 1
+## number_of_warning_events | ns kube-system OR ns general > 1
+
+resource "aws_cloudwatch_metric_alarm" "cluster_failed_node_count" {
+  count = var.has_metrics_server ? 1 : 0
+
+  alarm_name                = "${local.alert_prefix}-cluster-failed-node-count"
+  comparison_operator       = "GreaterThanThreshold"
+  evaluation_periods        = local.cw_evaluation_periods
+  metric_name               = "cluster_failed_node_count"
+  namespace                 = "ContainerInsights"
+  period                    = local.cw_alert_period
+  statistic                 = "Maximum"
+  threshold                 = 0
+  alarm_description         = "This metric monitors failed EKS Nodes in the ${var.cluster_name} cluster"
+  insufficient_data_actions = []
+  treat_missing_data        = "breaching"
+
+  alarm_actions = local.cw_alert_notification_sns_arns
+
+  dimensions = {
+    ClusterName = var.cluster_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "node_cpu_utilization" {
+  count = var.has_metrics_server ? 1 : 0
+
+  alarm_name                = "${local.alert_prefix}-node-cpu-utilization"
+  comparison_operator       = "GreaterThanThreshold"
+  evaluation_periods        = local.cw_evaluation_periods
+  metric_name               = "node_cpu_utilization"
+  namespace                 = "ContainerInsights"
+  period                    = local.cw_alert_period
+  statistic                 = "Maximum"
+  threshold                 = 90
+  alarm_description         = "This metric monitors maximum CPU node utilisation in the ${var.cluster_name} cluster"
+  insufficient_data_actions = []
+  treat_missing_data        = "breaching"
+
+  alarm_actions = local.cw_alert_notification_sns_arns
+  dimensions = {
+    ClusterName = var.cluster_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "node_memory_utilization" {
+  count = var.has_metrics_server ? 1 : 0
+
+  alarm_name                = "${local.alert_prefix}-node-memory-utilization"
+  comparison_operator       = "GreaterThanThreshold"
+  evaluation_periods        = local.cw_evaluation_periods
+  metric_name               = "node_memory_utilization"
+  namespace                 = "ContainerInsights"
+  period                    = local.cw_alert_period
+  statistic                 = "Maximum"
+  threshold                 = 90
+  alarm_description         = "This metric monitors maximum Memory node utilisation in the ${var.cluster_name} cluster"
+  insufficient_data_actions = []
+  treat_missing_data        = "breaching"
+
+  alarm_actions = local.cw_alert_notification_sns_arns
+  dimensions = {
+    ClusterName = var.cluster_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "node_filesystem_utilization" {
+  count = var.has_metrics_server ? 1 : 0
+
+  alarm_name                = "${local.alert_prefix}-node-filesystem-utilization"
+  comparison_operator       = "GreaterThanThreshold"
+  evaluation_periods        = local.cw_evaluation_periods
+  metric_name               = "node_filesystem_utilization"
+  namespace                 = "ContainerInsights"
+  period                    = local.cw_alert_period
+  statistic                 = "Maximum"
+  threshold                 = 90
+  alarm_description         = "This metric monitors maximum Diskspace node utilisation in the ${var.cluster_name} cluster"
+  insufficient_data_actions = []
+  treat_missing_data        = "breaching"
+
+  alarm_actions = local.cw_alert_notification_sns_arns
+  dimensions = {
+    ClusterName = var.cluster_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "pod_number_of_running_containers" {
+  count = var.has_metrics_server ? 1 : 0
+
+  alarm_name                = "${local.alert_prefix}-pod-number-of-running-containers"
+  comparison_operator       = "GreaterThanThreshold"
+  evaluation_periods        = local.cw_evaluation_periods
+  metric_name               = "pod_number_of_running_containers"
+  namespace                 = "ContainerInsights"
+  period                    = local.cw_alert_period
+  statistic                 = "Minimum"
+  threshold                 = 1
+  alarm_description         = "This metric monitors minimum containers that running in pods inside the ${var.cluster_name} cluster"
+  insufficient_data_actions = []
+  treat_missing_data        = "breaching"
+
+  alarm_actions = local.cw_alert_notification_sns_arns
+  dimensions = {
+    ClusterName = var.cluster_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "number_of_container_restarts" {
+  count = var.has_metrics_server ? 1 : 0
+
+  alarm_name                = "${local.alert_prefix}-number-of-container-restarts"
+  comparison_operator       = "GreaterThanUpperThreshold"
+  evaluation_periods        = local.cw_evaluation_periods
+  alarm_description         = "This metric monitors maximum for containers restarts in the ${var.cluster_name} cluster"
+  insufficient_data_actions = []
+  treat_missing_data        = "breaching"
+
+  alarm_actions = local.cw_alert_notification_sns_arns
+
+  threshold_metric_id = "ad1"
+
+  metric_query {
+    id          = "m1"
+    #period      = 0
+    return_data = true
+
+    metric {
+      dimensions = {
+        ClusterName = var.cluster_name
+      }
+      metric_name = "number_of_container_restarts"
+      namespace   = "ContainerInsights"
+      period      = local.cw_alert_period
+      stat        = "Maximum"
+    }
+  }
+  metric_query {
+    expression  = "ANOMALY_DETECTION_BAND(m1, 2)"
+    id          = "ad1"
+    label       = "number_of_container_restarts (expected)"
+    #period      = 0
+    return_data = true
+  }
+}
+
+### Scraping logs from logroup
+
+resource "aws_cloudwatch_metric_alarm" "number_of_warning_events" {
+  count = var.has_metrics_server ? 1 : 0
+
+  alarm_name                = "${local.alert_prefix}-number-of-warning-events"
+  comparison_operator       = "GreaterThanOrEqualToThreshold"
+  evaluation_periods        = local.cw_evaluation_periods
+  metric_name               = local.eks_event_metric_name
+  namespace                 = "ContainerInsights"
+  period                    = local.cw_alert_period
+  statistic                 = "SampleCount"
+  threshold                 = 1
+  alarm_description         = "This metric monitors kubernetes events from ${var.k8s_ns_events_to_collect} namespaces with ${var.k8s_ns_events_severity} severity"
+  insufficient_data_actions = []
+  treat_missing_data        = "notBreaching"
+
+  alarm_actions = local.cw_alert_notification_sns_arns
+}
+
+variable "k8s_ns_events_to_collect" {
+  type        = string
+  default     = "kube-system, general, argocd"
+  description = "Comma-separated string of kubernetes namespaces to collect the events from. Put \"all\" to collect all the namespaces"
+}
+variable "k8s_ns_events_severity" {
+  type        = string
+  default     = "Warning"
+  description = "Kubernetes events severity. Could be: Warning or Normal."
+  validation {
+    condition     = contains(["Warning", "Normal"], var.k8s_ns_events_severity)
+    error_message = "Kubernetes events severity \"Warning\" or \"Normal\"."
+  }
+}
+
+### Timing settings
+variable "k8s_metrics_batch_interval" {
+  type        = string
+  default     = "1m"
+  description = "Kubernetes metrics scrape batch inerval in minutes. Could be in seconds as well: 30s"
+}
+
+###
+variable "k8s_ns_events_retention_days" {
+  type        = number
+  default     = 14
+  description = "AWS CloudWatch log group retention in days."
+}
+variable "toleration_pool" {
+  type        = string
+  default     = "system"
+  description = "EKS pool, the current resources are tollerated to."
+}
