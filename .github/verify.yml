@@ -2,6 +2,11 @@
 name: Verify
 # This workflow is triggered on pushes to the repository.
 on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
   workflow_dispatch:
 
 jobs:
