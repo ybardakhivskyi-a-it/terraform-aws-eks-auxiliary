@@ -11,8 +11,8 @@ on:
 
 jobs:
   terraform_validate:
-    name: "Format and validate code"
-    runs-on: ubuntu-latest
+    name: "Format and Validate Code"
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +29,8 @@ jobs:
         run: terraform validate
 
   tflint:
-    name: "Lint code"
-    runs-on: ubuntu-latest
+    name: "Lint Code"
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
@@ -53,3 +53,17 @@ jobs:
 
       - name: Run TFLint
         run: tflint -f compact
+
+  tfsec:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner in fs mode
+        uses: aquasecurity/trivy-action@0.17.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          trivy-config: trivy.yaml
